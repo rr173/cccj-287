@@ -1,0 +1,197 @@
+# 文档审阅后端
+
+使用 Python + FastAPI + SQLite 实现的无界面文档审阅服务。审阅建议组可以绑定任意历史修订；作者继续编辑后，服务会沿完整修订历史迁移建议区间，并依据历史操作而不是“现在的文字是否相同”判断冲突。
+
+## 直接运行
+
+```bash
+python3 -m pip install -r requirements.txt
+./run.sh
+# 等价方式：python3 main.py
+# 或：DOC_REVIEW_DB=/var/lib/doc-review/review.db \
+#     python3 -m uvicorn doc_review.main:app --host 127.0.0.1 --port 8000
+```
+
+默认监听 <http://127.0.0.1:8000>，SQLite 文件为 `./data/review.db`。交互式 OpenAPI 文档在 `/docs`，但业务不依赖界面。
+
+另开终端运行简短 HTTP 示例：
+
+```bash
+python3 examples/quickstart.py
+```
+
+## 一分钟 curl 示例
+
+```bash
+BASE=http://127.0.0.1:8000
+
+# 创建文档，初始修订为 0
+DOC_ID=$(curl -sS -X POST "$BASE/documents" \
+  -H 'Content-Type: application/json' \
+  -d '{"content":"Hello review world"}' | jq -r .id)
+
+# 读取指定历史修订
+curl -sS "$BASE/documents/$DOC_ID/revisions/0" | jq
+
+# 在 [6,12) 处提出替换 "review" -> "REVIEW"
+GRP_ID=$(curl -sS -X POST "$BASE/documents/$DOC_ID/suggestion-groups" \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":0,"suggestions":[{"start":6,"end":12,"replacement":"REVIEW"}]}' \
+  | jq -r .id)
+
+# 作者先在文首插入前缀；此时修订 0 仍是当前版，返回 201 和 revision 1
+curl -sS -X POST "$BASE/documents/$DOC_ID/edits" \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":0,"start":0,"end":0,"replacement":">> "}' | jq
+
+# 另一个作者仍基于修订 0 修改 "world" [13,18)：返回 409，
+# 其中 rebased_range.current_range 已平移为 [16,21)
+curl -sS -X POST "$BASE/documents/$DOC_ID/edits" \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":0,"start":13,"end":18,"replacement":"earth"}' | jq
+
+# 按 current_revision=1 和重定位区间重新提交
+curl -sS -X POST "$BASE/documents/$DOC_ID/edits" \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":1,"start":16,"end":21,"replacement":"earth"}' | jq
+
+# 查看建议在当前修订上的位置：前缀使其从 [6,12) 移到 [9,15)
+curl -sS "$BASE/suggestion-groups/$GRP_ID" \
+  | jq '{clean: .drift_clean, range: .items[0].current_range, text: .items[0].current_text}'
+
+# 接受建议组；request_id 用于安全重试
+curl -sS -X POST "$BASE/suggestion-groups/$GRP_ID/accept" \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"accept-001"}' | jq
+
+# 同一 request_id 重试返回首次结果，响应头带 Idempotent-Replayed: true
+curl -i -X POST "$BASE/suggestion-groups/$GRP_ID/accept" \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"accept-001"}'
+```
+
+## HTTP 接口
+
+| 方法与路径 | 说明 |
+| --- | --- |
+| `POST /documents` | 创建文档，可传 `title`、`content`；初始修订号为 `0` |
+| `GET /documents/{id}` | 读取文档和当前正文 |
+| `GET /documents/{id}/revisions` | 列出历史修订元数据 |
+| `GET /documents/{id}/revisions/{rev}` | 读取指定修订正文 |
+| `POST /documents/{id}/edits` | 提交一次区间替换/插入/删除，必须带 `base_revision`、`start`、`end`、`replacement` |
+| `POST /documents/{id}/suggestion-groups` | 创建绑定 `base_revision` 的建议组 |
+| `GET /documents/{id}/suggestion-groups` | 列出文档的建议组 |
+| `GET /suggestion-groups/{group_id}` | 查询建议组；待处理组会实时给出当前定位 |
+| `POST /suggestion-groups/{group_id}/accept` | 原子接受整组，需在 body 或 `Idempotency-Key` 头中提供 `request_id` |
+| `POST /suggestion-groups/{group_id}/close` | 关闭建议组；关闭后不能接受 |
+| `GET /suggestion-groups/{group_id}/result` | 查阅已成功接受并落为新修订的结果 |
+
+### 正文编辑冲突
+
+`POST /documents/{id}/edits` 的 `base_revision` 必须等于当前修订。过期时返回 HTTP 409：
+
+```json
+{
+  "error": {
+    "code": "revision_conflict",
+    "base_revision": 0,
+    "current_revision": 2,
+    "rebased_range": {
+      "conflict": false,
+      "original_range": {"start": 2, "end": 5},
+      "current_range": {"start": 8, "end": 11},
+      "current_text": "..."
+    }
+  }
+}
+```
+
+服务不会自动覆盖后来的编辑；调用方应按 `rebased_range` 重新审阅并以 `current_revision` 为新基准提交。可选 `request_id` 也能保证编辑请求重试返回首次结果。
+
+### 创建建议组时的漂移检查
+
+请求示例：
+
+```json
+{
+  "base_revision": 3,
+  "suggestions": [
+    {"client_id": "s1", "start": 10, "end": 14, "replacement": "新文本"},
+    {"client_id": "s2", "start": 20, "end": 22, "replacement": ""}
+  ]
+}
+```
+
+- 位置按 **Unicode 码点**计算，Python 的 `len(str)` 与字符串切片即为该口径。
+- 所有区间都是 `[start, end)`；相邻但不重叠的区间合法。
+- 建议区间必须非空且互不相交。
+- 默认会保存语法合法的历史建议组，并在响应中给出 `drift_clean` 和逐项 `items` 定位。
+- 若希望“基准版到当前版之间已有冲突就不创建”，调用 `POST .../suggestion-groups?strict=true`；此时返回 409 且不落库建议组。
+
+### 定位与冲突规则
+
+对于建议指向的旧区间 `[s,e)`，逐个经过后续修订中的替换操作 `[a,b) -> replacement`：
+
+- `b <= s`：操作完全在原文前方；位置随增删平移。`a=b=s` 的起点插入也按“原文之前”处理，因此起点和终点都后移。
+- `a >= e`：操作完全在原文后方；不影响区间位置。`a=b=e` 的终点插入按“原文之后”处理，终点不移动。
+- `s < a=b < e`：严格位于区间内部的插入，判为冲突，错误码 `internal_insertion`。
+- 其他与区间有正长度交集的删除/替换，判为冲突，错误码 `intersecting_edit`。
+
+每次接受成功产生的修订会把该组所有已定位操作存入 `revision_ops`，因此后续建议也会穿过“接受建议”造成的修订，而不只是穿过作者编辑。
+
+冲突响应是 HTTP 409，`error.items[]` 逐项包含：
+
+- `original_range`：建议组基准修订中的原区间；
+- `current_range`：当前修订上的可定位区间；若原文已被整段删除，可能是零宽定位点；
+- `current_text`：该区间当前文字；
+- `context_range` / `context_text`：定位点前后的码点上下文，方便重新审阅；
+- `conflicts[]`：具体冲突修订、来源（作者编辑或接受建议）、当时的操作区间和替换文本。
+
+历史上一旦发生过交集修改，该项会永久保留冲突记录。即使后续又把文字改回原样，`conflicts[]` 仍非空，不会被误判为未改动。
+
+### 原子接受、幂等和并发
+
+- 一个建议组中的任意一项冲突：HTTP 409，整组不创建新修订、正文完全不变、建议组仍为 `pending`。
+- 全部可定位：所有替换落在同一份当前修订上，并只创建一个新修订。
+- 接受请求必须带 `request_id` 或 `Idempotency-Key`。同一作用域下相同 ID 的重试，包括并发重试，返回数据库中保存的首次状态码和响应体，并带 `Idempotent-Replayed: true`。
+- 不同请求 ID 的两个并发接受由 SQLite `BEGIN IMMEDIATE` 串行化，再用 `status='pending'` 条件更新竞争：恰好一个返回 200，另一个返回 `suggestion_group_already_accepted`。
+- 已关闭组接受时返回 `suggestion_group_closed`，不会落稿。
+- 所有修订、建议组、逐项建议、幂等结果和关闭原因均在 SQLite 中，重启进程后仍可查询。
+
+## 自动化验证
+
+一键端到端验证会自己启动 Uvicorn、使用临时 SQLite 文件、发起真实 HTTP 并发请求，并验证重启持久化：
+
+```bash
+python3 verify.py
+```
+
+它展示：
+
+1. 连续多轮前缀插入/替换/删除后，旧建议准确移动并成功替换；
+2. 一次成功接受造成的位置变化会继续移动另一个待审建议；
+3. 一组中一项冲突时，整组返回逐项冲突且不产生任何新修订；
+4. 三个并发竞争轮次中，不同请求 ID 始终只有一个成功；
+5. 同一请求 ID 的并发重试得到同一份首次结果；
+6. 关闭后不能接受；
+7. 停止并重启服务后，历史修订和已完成结果仍可查阅。
+
+单元/接口测试：
+
+```bash
+python3 -m pytest -q
+```
+
+## 主要文件
+
+```text
+doc_review/
+  main.py       # FastAPI 路由与应用工厂
+  service.py    # 修订、建议组、幂等和并发接受用例
+  mapping.py    # 纯区间迁移/冲突判定逻辑
+  db.py         # SQLite schema、连接和立即写事务
+  schemas.py    # 请求模型
+verify.py       # 真实 HTTP + 并发 + 重启的端到端验证
+examples/
+  quickstart.py # 简短调用示例
+```
