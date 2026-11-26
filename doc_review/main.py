@@ -48,6 +48,7 @@ from .service import (
     list_revisions,
     submit_edit,
 )
+from .sync_api import router as sync_router
 
 
 def create_app(database_path: str | Path = "data/review.db") -> FastAPI:
@@ -77,6 +78,7 @@ def create_app(database_path: str | Path = "data/review.db") -> FastAPI:
 
     app.state.database_path = database_target
     app.state.memory_keeper = memory_keeper
+    app.include_router(sync_router)
 
     # Initialize synchronously so TestClient and `uvicorn` are immediately ready.
     init_connection = connect(app.state.database_path)
@@ -117,6 +119,13 @@ def create_app(database_path: str | Path = "data/review.db") -> FastAPI:
             "service": "document-review-backend",
             "docs": "/docs",
             "health": "/health",
+            "offline_sync": {
+                "register": "POST /sync/devices",
+                "subscriptions": "PUT /sync/devices/{device_id}/subscriptions",
+                "pull": "POST /sync/devices/{device_id}/pull",
+                "page": "GET /sync/devices/{device_id}/batches/{sequence}/pages/{page}",
+                "confirm": "POST /sync/devices/{device_id}/batches/{sequence}/confirm",
+            },
         }
 
     @app.post("/documents", status_code=201)

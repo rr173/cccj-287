@@ -150,6 +150,69 @@ CREATE TABLE IF NOT EXISTS public_retractions (
     retracted_at TEXT NOT NULL,
     FOREIGN KEY (public_version_id) REFERENCES public_versions(id) ON DELETE CASCADE
 );
+
+-- Offline sync devices. A device has an independent subscription set and a
+-- monotonic sequence of reconciliation batches. last_ack_sequence is the
+-- newest batch for which the server has accepted the device's confirmation.
+CREATE TABLE IF NOT EXISTS sync_devices (
+    id TEXT PRIMARY KEY,
+    max_page_items INTEGER NOT NULL CHECK (max_page_items BETWEEN 1 AND 100),
+    last_ack_sequence INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sync_subscriptions (
+    device_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    document_id TEXT NOT NULL,
+    PRIMARY KEY (device_id, document_id),
+    UNIQUE (device_id, ordinal),
+    FOREIGN KEY (device_id) REFERENCES sync_devices(id) ON DELETE CASCADE
+);
+
+-- Every offered batch is immutable once created. target_* is the complete
+-- replica state that results from applying that batch, not merely the changed
+-- rows. Keeping all unacknowledged batches lets a later batch reconcile both
+-- never-applied and applied-but-unconfirmed possible device states.
+CREATE TABLE IF NOT EXISTS sync_batches (
+    device_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    batch_id TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'acknowledged', 'invalidated')),
+    target_signature TEXT NOT NULL,
+    mapping_json TEXT NOT NULL,
+    target_ids_json TEXT NOT NULL,
+    page_count INTEGER NOT NULL,
+    write_count INTEGER NOT NULL,
+    delete_count INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    acknowledged_at TEXT,
+    PRIMARY KEY (device_id, sequence),
+    FOREIGN KEY (device_id) REFERENCES sync_devices(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_batches_device_batch
+    ON sync_batches(device_id, batch_id);
+
+CREATE TABLE IF NOT EXISTS sync_batch_pages (
+    batch_id TEXT NOT NULL,
+    page_number INTEGER NOT NULL,
+    writes_json TEXT NOT NULL,
+    delete_ids_json TEXT NOT NULL,
+    PRIMARY KEY (batch_id, page_number),
+    FOREIGN KEY (batch_id) REFERENCES sync_batches(batch_id) ON DELETE CASCADE
+);
+
+-- Persist which pages were successfully served. Confirmation is rejected until
+-- every page of a pending batch has been provided by the server.
+CREATE TABLE IF NOT EXISTS sync_batch_served_pages (
+    batch_id TEXT NOT NULL,
+    page_number INTEGER NOT NULL,
+    served_at TEXT NOT NULL,
+    PRIMARY KEY (batch_id, page_number),
+    FOREIGN KEY (batch_id) REFERENCES sync_batches(batch_id) ON DELETE CASCADE
+);
 """
 
 

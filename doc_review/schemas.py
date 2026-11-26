@@ -76,3 +76,42 @@ class ReleaseConfirmRequest(BaseModel):
 
 class RetractRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=1000)
+
+
+# ---- Offline sync API ----
+
+
+class DeviceRegisterRequest(BaseModel):
+    # A client may supply its own stable ID. If omitted, the server mints one.
+    device_id: str | None = Field(default=None, min_length=1, max_length=200)
+    name: str | None = Field(default=None, max_length=200)
+
+    # Canonical name plus common aliases accepted by early clients/examples.
+    max_page_items: int | None = None
+    max_changes_per_page: int | None = None
+    max_items_per_page: int | None = None
+    max_page_size: int | None = None
+    page_item_limit: int | None = None
+    items_per_page: int | None = None
+    per_page: int | None = None
+    page_limit: int | None = None
+    page_size: int | None = None
+    limit: int | None = None
+
+    # Optional convenience: register and make the first subscription set in
+    # one call. The dedicated subscription endpoint remains the normal path.
+    document_ids: list[str] | None = None
+    subscriptions: list[str | dict] | None = None
+    ids: list[str] | None = None
+
+
+class SubscriptionUpdateRequest(BaseModel):
+    # Preferred: {"document_ids": ["doc_a", "doc_b"]}.
+    document_ids: list[str] | None = None
+    # Aliases. "subscriptions" may contain IDs or {"document_id": "..."}.
+    subscriptions: list[str | dict] | None = None
+    ids: list[str] | None = None
+
+
+class SyncConfirmRequest(BaseModel):
+    request_id: str | None = Field(default=None, min_length=1, max_length=200)

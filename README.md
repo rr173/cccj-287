@@ -112,6 +112,12 @@ curl -sS "$BASE/public/versions/$PUB_ID" | jq
 | `GET /public/documents/{id}/versions` | 列出该文档的公开版及是否可读 |
 | `GET /public/versions/{public_version_id}` | 按公开版 ID 读取正文和按序固定的直接引用 |
 | `POST /public/versions/{public_version_id}/retract` | 撤下一个明确的公开版 |
+| `POST /sync/devices` | 登记离线设备，指定每页写入与删除项总数上限（1–100） |
+| `PUT /sync/devices/{device_id}/subscriptions` | 整体更换该设备订阅的文档 ID 集合；设备间独立 |
+| `POST|GET /sync/devices/{device_id}/pull` | 拉取当前批次首页；无变化时返回 `in_sync` |
+| `GET /sync/devices/{device_id}/batches/{seq}/pages/{page}` | 重复读取同一不可变分页（页码从 1 开始） |
+| `POST /sync/devices/{device_id}/batches/{seq}/confirm`（或 `/ack`） | 所有页取齐并应用后确认；重试确认幂等 |
+| `GET /sync/batches/{batch_id}/pages/{page}` / `POST /sync/batches/{batch_id}/ack` | 只保存了全局批次 ID 时的等价别名 |
 
 ### 正文编辑冲突
 
@@ -256,6 +262,96 @@ curl -sS -X POST "$BASE/public/versions/$PUB_ID/retract" \
 - 确认发行与撤下都在 SQLite `BEGIN IMMEDIATE` 中决策：先撤下则确认被阻塞；先确认则撤下成功后新版本立即可被判定为屏蔽。两种顺序都不会让读者读到受影响的版本。
 - 发行单、公开版、引用关系与撤下记录都持久化在 SQLite，重启后结果不变。
 
+## HTTP 离线同步
+
+现场设备在有网时同步，随后离线使用。设备**不需要、也不会上传本地清单**；服务端依据当前公开图、设备订阅、已确认序号以及所有尚未确认但可能已被应用的批次做保守对账。
+
+### 目标副本如何计算
+
+对设备订阅集合中的每个文档：
+
+1. 取该文档**当前最新且可读**的公开版作为订阅根；若从未发行、最新版被撤下或被其引用图中的撤下版本屏蔽，则该订阅项映射为 `null`，**不回退到旧公开版**。
+2. 从每个可读根出发，沿公开版中冻结的、有序的公开版 ID 引用做闭包遍历。
+3. 引用始终指向发行时锁定的旧版；文档后来发行的最新版不会替换被引用版本。
+4. 一个旧版即使不再是任何订阅文档的最新版，只要仍在另一个保留根的固定引用闭包中，就仍属于目标，不会被删除。
+
+每次拉取都在一个 SQLite `BEGIN IMMEDIATE` 事务中完成目标计算、失效判断和批次持久化，因此与发行确认、撤下、订阅更换交错时，一次响应只依据一个一致状态。撤下提交后才开始的取页/确认请求会看到旧批次失效，不能再取到因此不可读的正文。
+
+### 登记、订阅和分页
+
+登记时用 `max_page_items`（也接受 `page_limit`/`page_size`）指定每页 `writes.length + delete_ids.length` 的上限，范围为 1–100。可传自己的 `device_id`；重复登记同一 ID 且分页限制相同会回放首次响应。
+
+```bash
+BASE=http://127.0.0.1:8000
+
+DEVICE=$(curl -sS -X POST "$BASE/sync/devices" \
+  -H 'Content-Type: application/json' \
+  -d '{"device_id":"shop-tablet-01","max_page_items":2}' \
+  | jq -r .device_id)
+
+# 整体替换订阅集合；也接受原始 JSON 数组或 {"ids":[...]}。
+curl -sS -X PUT "$BASE/sync/devices/$DEVICE/subscriptions" \
+  -H 'Content-Type: application/json' \
+  -d '{"document_ids":["'"$DOC_A"'","'"$DOC_B"'"]}' | jq
+
+# 拉取或重试当前未确认批次的第 1 页。
+curl -sS -X POST "$BASE/sync/devices/$DEVICE/pull" | jq
+```
+
+拉取响应在有变更时包含：
+
+- `sequence` / `seq`：设备内单调递增的批次序号；
+- `batch_id` / `id`：全局批次 ID；
+- `page_count`、`page_number`、`next_page`；
+- `subscription_mapping[]`：每项 `{document_id, public_version_id, readable}`；
+- `writes[]`：按公开版 ID 给出 `content`、标题、文档/修订信息，以及有序的 `references: [public_version_id, ...]`（另有 `reference_details`）；
+- `delete_ids[]`：应从本地副本删除的公开版 ID；删除不存在的 ID 无害；
+- `changes[]`：把写入表示为 `op:"put"`、删除表示为 `op:"delete"` 的合并便捷视图。
+
+客户端必须取齐 `1..page_count` 的所有页，然后才整体替换订阅映射并应用写入/删除。示例客户端：
+
+```bash
+SEQ=1
+PAGE_COUNT=$(curl -sS -X POST "$BASE/sync/devices/$DEVICE/pull" | jq .page_count)
+for PAGE in $(seq 1 "$PAGE_COUNT"); do
+  curl -sS "$BASE/sync/devices/$DEVICE/batches/$SEQ/pages/$PAGE" > "/tmp/sync-page-$PAGE.json"
+done
+
+# 只有所有页齐全后，离线程序才提交本地事务并替换映射。
+curl -sS -X POST "$BASE/sync/devices/$DEVICE/batches/$SEQ/confirm" \
+  -H 'Content-Type: application/json' -d '{}' | jq
+```
+
+当目标与服务端记录的已确认目标一致且没有待处理批次时，`POST .../pull` 返回 `status:"in_sync"`、`synced:true`。
+
+### 重试、失效和漏确认
+
+- 目标不变时，重复 `pull` 返回同一序号、同一 `batch_id` 和同一第 1 页；重复 GET 同一页也返回相同分页。
+- 服务端持久化记录已成功提供的页码。未取齐所有页时确认返回 `409 sync_batch_pages_incomplete`，并列出 `served_page_numbers` / `missing_page_numbers`。
+- 新发行、撤下或订阅更换使当前目标（包括订阅映射）不同于未确认批次时：
+  - 旧批次状态永久变为 `invalidated`；
+  - 旧页不再返回正文，旧确认返回 `409 sync_batch_stale` / `can_revive:false`；
+  - 再次 `pull` 会生成更高序号的新纠正批次。
+- 已被服务端成功处理的确认，即使响应丢失、之后目标又变化，重试仍返回 200 和 `Idempotent-Replayed: true`，且 `last_ack_sequence` 不倒退。
+- 客户端可以跳过旧批次；应用序号 N 后忽略所有 `<= N` 的批次/响应，并确认 N。
+
+新批次按所有可能的本地状态保守生成。设服务端最新已确认序号为 A，则可能状态包括 A 的完整目标，以及 A 之后**所有页均已提供、因而客户端可能已集齐并应用**的批次完整目标（客户端也可能从未应用，或已应用但确认丢失/迟到）。未取齐页的批次不能被符合协议的客户端原子应用，不会作为可能的已安装状态。对这些状态：
+
+- `delete_ids = 所有可能状态中的版本并集 − 当前目标集合`；
+- `writes = 当前目标集合 − 所有可能状态中的版本交集`。
+
+因此，从未应用旧批的设备会收到全部所需正文和无害删除；已经应用旧批但确认丢失的设备会收到缺失正文和所有可能残留 ID 的删除。连续多次确认丢失也按同一并集/交集规则收敛。
+
+设备、订阅、批次、分页、已提供页码和确认序号都保存在现有 SQLite 数据库中；服务重启后批次回放与确认幂等性不变。
+
+可运行的 HTTP 调用示例：
+
+```bash
+python3 examples/offline_sync.py
+```
+
+离线同步的自动化测试位于 `tests/test_sync.py`，覆盖分页上限、固定引用、订阅更换、旧版保留、撤下不回退、旧批失效、漏确认/连续漏确认对账以及重启持久化。
+
 ## 自动化验证
 
 一键端到端验证会自己启动 Uvicorn、使用临时 SQLite 文件、发起真实 HTTP 并发请求，并验证重启持久化：
@@ -285,6 +381,8 @@ python3 verify.py
 python3 -m pytest -q
 ```
 
+其中 `tests/test_sync.py` 专门验证离线同步协议；该文件使用 FastAPI `TestClient` 和临时 SQLite，不需要额外客户端界面。
+
 ## 主要文件
 
 ```text
@@ -292,6 +390,8 @@ doc_review/
   main.py       # FastAPI 路由与应用工厂
   service.py    # 修订、建议组、幂等和并发接受用例
   release.py    # 发行单、公开版、引用图与撤下
+  sync.py       # 离线设备目标图、批次/分页、失效与漏确认对账
+  sync_api.py   # 离线同步 HTTP 路由
   mapping.py    # 纯区间迁移/冲突判定逻辑
   db.py         # SQLite schema、连接和立即写事务
   schemas.py    # 请求模型
