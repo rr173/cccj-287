@@ -55,3 +55,44 @@ accepted = httpx.post(
 ).raise_for_status().json()
 print("new revision:", accepted["revision"])
 print("content:", accepted["content"])
+
+# ---- Release a batch to readers ------------------------------------------
+# Two docs; the second references the first.  Both appear only after confirm.
+doc_two = httpx.post(
+    f"{base_url}/documents",
+    json={"title": "手册第二页", "content": "参见第一页。"},
+    timeout=10,
+).raise_for_status().json()
+
+ticket = httpx.post(
+    f"{base_url}/release-tickets",
+    json={
+        "items": [
+            {"document_id": doc_id, "revision": accepted["revision"], "references": [doc_two["id"]]},
+            {"document_id": doc_two["id"], "revision": 0, "references": []},
+        ]
+    },
+    timeout=10,
+).raise_for_status().json()
+print("prepared ticket locks:", [(i["document_id"], i["revision"]) for i in ticket["items"]])
+
+released = httpx.post(
+    f"{base_url}/release-tickets/{ticket['ticket_id']}/confirm",
+    json={},
+    timeout=10,
+).raise_for_status().json()
+public_ids = {item["document_id"]: item["public_version_id"] for item in released["items"]}
+print("public version IDs:", public_ids)
+
+latest = httpx.get(f"{base_url}/public/documents/{doc_id}", timeout=10).raise_for_status().json()
+print("reader sees:", latest["content"])
+print("frozen references:", [ref["public_version_id"] for ref in latest["references"]])
+
+# Retract the referenced page's public version; referencing entry is hidden.
+httpx.post(
+    f"{base_url}/public/versions/{public_ids[doc_two['id']]}/retract",
+    json={"reason": "示例撤下"},
+    timeout=10,
+).raise_for_status()
+hidden = httpx.get(f"{base_url}/public/documents/{doc_id}", timeout=10)
+print("referencing entry after retraction:", hidden.status_code, hidden.json()["error"]["code"])

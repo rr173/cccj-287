@@ -478,7 +478,7 @@ def verify_race_and_close(client: Client) -> None:
 
 
 def verify_restart_persistence(db_path: Path, doc_id: str, group_id: str) -> None:
-    section("4. Restart server and confirm history/results survived")
+    section("7. Restart server and confirm revision/suggestion history survived")
     process, base_url, _ = start_server(db_path)
     try:
         client = Client(base_url)
@@ -512,20 +512,323 @@ def verify_restart_persistence(db_path: Path, doc_id: str, group_id: str) -> Non
         stop_server(process)
 
 
+# ---------------------------------------------------------------------------
+# Release-ticket / public-reading scenarios
+# ---------------------------------------------------------------------------
+
+
+def prepare_ticket(
+    client: Client, items: list[dict[str, Any]], expected: int = 201, **extra: Any
+) -> dict[str, Any]:
+    body = {"items": items, **extra}
+    response = client.call("POST", "/release-tickets", json=body)
+    assert response.status_code == expected, response.text
+    return response.json()
+
+
+def confirm_ticket(
+    client: Client, ticket_id: str, expected: int = 201
+) -> dict[str, Any]:
+    response = client.call(
+        "POST", f"/release-tickets/{ticket_id}/confirm", json={}
+    )
+    assert response.status_code == expected, response.text
+    return response.json()
+
+
+def release_one(
+    client: Client, document_id: str, revision: int = 0
+) -> dict[str, Any]:
+    ticket = prepare_ticket(
+        client, [{"document_id": document_id, "revision": revision, "references": []}]
+    )
+    released = confirm_ticket(client, ticket["ticket_id"])
+    return released["items"][0]
+
+
+def verify_release_prepare_validation(client: Client) -> None:
+    section("4. Preparing a ticket locks versions and rejects broken batches")
+
+    c = client.create_doc("C 正文", "rel-c")
+    b = client.create_doc("B 正文", "rel-b")
+    a = client.create_doc("A 正文", "rel-a")
+    draft = client.create_doc("内部草稿", "rel-draft")
+
+    # Never released: unreleased content has no public entry.
+    missing = client.call("GET", f"/public/documents/{draft}")
+    assert missing.status_code == 404, missing.text
+
+    c_release = release_one(client, c)
+    c_public_id = c_release["public_version_id"]
+    b_release = release_one(client, b)  # externals later point at B's version
+
+    # Reject a missing external public version.
+    rejected = prepare_ticket(
+        client,
+        [{"document_id": a, "revision": 0, "references": [draft]}],
+        expected=409,
+    )
+    assert (
+        rejected["error"]["problems"][0]["code"]
+        == "external_document_has_no_public_version"
+    )
+
+    # Reject a ticket-internal cycle and name the documents in the cycle.
+    cycle = prepare_ticket(
+        client,
+        [
+            {"document_id": a, "revision": 0, "references": [b]},
+            {"document_id": b, "revision": 0, "references": [a]},
+        ],
+        expected=409,
+    )
+    cycle_problem = next(
+        problem
+        for problem in cycle["error"]["problems"]
+        if problem["code"] == "cyclic_reference"
+    )
+    assert set(cycle_problem["document_ids"][:-1]) == {a, b}
+    print("cycle rejected:", cycle_problem["document_ids"])
+
+    # Prepare the ticket first; it locks the latest public versions of B and C
+    # that exist right now.
+    ticket = prepare_ticket(
+        client,
+        [
+            {
+                "document_id": a,
+                "revision": 0,
+                "references": [b, c],
+            },
+        ],
+    )
+    assert ticket["status"] == "prepared"
+    (a_item,) = ticket["items"]
+    # Prepare reports the locked revisions and external public versions.
+    assert a_item["revision"] == 0
+    assert a_item["references"][0]["document_id"] == b
+    assert a_item["references"][0]["public_version_id"] == b_release["public_version_id"]
+    assert a_item["references"][1]["document_id"] == c
+    assert a_item["references"][1]["public_version_id"] == c_public_id
+    print(
+        "prepared locks:",
+        [(item["document_id"], item["revision"]) for item in ticket["items"]],
+        "external:",
+        ticket["external_locks"],
+    )
+
+    # Now the author edits B and a *different* ticket publishes B's newer
+    # revision before this ticket is confirmed.  That must not replace this
+    # ticket's locked B public version.
+    client.edit_current_text(b, "B 正文", "B 第二版", "rel-b-edit")
+    b_newer = release_one(client, b, revision=1)
+    assert b_newer["public_version_id"] != b_release["public_version_id"]
+
+    released = confirm_ticket(client, ticket["ticket_id"])
+    ids = {item["document_id"]: item["public_version_id"] for item in released["items"]}
+    a_public_id = ids[a]
+
+    a_public = client.expect("GET", f"/public/versions/{a_public_id}", 200)
+    assert a_public["content"] == "A 正文"
+    assert a_public["references"][0]["public_version_id"] == b_release["public_version_id"]
+    assert a_public["references"][1]["public_version_id"] == c_public_id
+
+    latest = client.expect("GET", f"/public/documents/{a}", 200)
+    assert latest["public_version_id"] == a_public_id
+    assert [ref["ref_index"] for ref in latest["references"]] == [0, 1]
+
+    # Re-confirm only replays; the latest public entry stays unchanged.
+    replay = client.call("POST", f"/release-tickets/{ticket['ticket_id']}/confirm", json={})
+    assert replay.status_code == 200
+    assert replay.headers.get("idempotent-replayed") == "true"
+    assert replay.json() == released
+    assert (
+        client.expect("GET", f"/public/documents/{a}", 200)["public_version_id"]
+        == a_public_id
+    )
+    print("confirm replay returned the original public version IDs")
+    # The retraction scenario withdraws the B public version A locked, which is
+    # the earlier B version, fixed at prepare time.
+    return a, a_public_id, b, c, c_public_id, b_release["public_version_id"]
+
+
+def verify_retraction(
+    client: Client,
+    *,
+    a_id: str,
+    a_public_id: str,
+    b_id: str,
+    b_old_public_id: str,
+    c_id: str,
+    c_public_id: str,
+) -> None:
+    section("5. Retracting one public version hides referencing versions only")
+
+    # B's old version is referenced by A's public entry.  Retract it.
+    retraction = client.call(
+        "POST", f"/public/versions/{b_old_public_id}/retract", json={"reason": "bad"}
+    )
+    assert retraction.status_code == 200, retraction.text
+    assert c_public_id not in retraction.json()["affected_public_version_ids"]
+
+    # A references B(old) directly, so A is unreadable - even though A itself
+    # was never retracted and B has a newer readable public version.
+    a_direct = client.call("GET", f"/public/versions/{a_public_id}")
+    assert a_direct.status_code == 409, a_direct.text
+    assert b_old_public_id in a_direct.json()["error"]["blocked_public_version_ids"]
+    a_latest = client.call("GET", f"/public/documents/{a_id}")
+    assert a_latest.status_code == 409, a_latest.text
+
+    # The explicitly retracted old B version is unreadable, but B's newer
+    # version and unrelated C are still readable.
+    assert client.call("GET", f"/public/versions/{b_old_public_id}").status_code == 409
+    b_latest = client.expect("GET", f"/public/documents/{b_id}", 200)
+    assert b_latest["public_version_id"] != b_old_public_id
+    assert client.expect("GET", f"/public/versions/{c_public_id}", 200)["content"] == "C 正文"
+
+    # Retraction targets a version, not the document or author revisions.
+    revision = client.expect("GET", f"/documents/{b_id}/revisions/0", 200)
+    assert revision["content"] == "B 正文"
+    draft_ok = client.expect("GET", f"/documents/{b_id}", 200)
+    assert draft_ok["content"] == "B 第二版"
+    # B's newer, unrelated public version is still readable.
+    newer = client.expect("GET", f"/public/documents/{b_id}", 200)
+    assert newer["public_version_id"] != b_old_public_id
+    assert newer["content"] == "B 第二版"
+    print("retraction affected only referencing public versions")
+
+
+def verify_restart_release_state(
+    db_path: Path,
+    *,
+    a_id: str,
+    a_public_id: str,
+    b_id: str,
+    b_old_public_id: str,
+    c_public_id: str,
+) -> None:
+    section("8. Restart keeps public locks, retraction, and release history")
+    process, base_url, _ = start_server(db_path)
+    try:
+        client = Client(base_url)
+        try:
+            # Latest public entry for A is still hidden after restart.
+            blocked = client.call("GET", f"/public/documents/{a_id}")
+            assert blocked.status_code == 409
+            assert b_old_public_id in blocked.json()["error"]["blocked_public_version_ids"]
+            assert client.call("GET", f"/public/versions/{a_public_id}").status_code == 409
+
+            # The explicit retraction survived, and the unrelated version did too.
+            assert client.call("GET", f"/public/versions/{b_old_public_id}").status_code == 409
+            unrelated = client.expect("GET", f"/public/versions/{c_public_id}", 200)
+            assert unrelated["content"] == "C 正文"
+
+            # A's author text and revisions survived independently.
+            author = client.expect("GET", f"/documents/{b_id}", 200)
+            assert author["content"] == "B 第二版"
+
+            versions = client.expect("GET", f"/public/documents/{b_id}/versions", 200)
+            statuses = {
+                entry["public_version_id"]: entry["readable"]
+                for entry in versions["public_versions"]
+            }
+            assert statuses[b_old_public_id] is False
+            print("after restart: A latest blocked, B old retracted, author text intact")
+        finally:
+            client.close()
+    finally:
+        stop_server(process)
+
+
+def verify_confirm_retract_race(client: Client) -> None:
+    section("6. Concurrent confirm vs retract has one consistent outcome")
+
+    for round_index in range(3):
+        external = client.create_doc(f"外部 {round_index}", f"race-ext-{round_index}")
+        external_release = release_one(client, external)
+        external_version = external_release["public_version_id"]
+
+        target = client.create_doc(f"目标 {round_index}", f"race-main-{round_index}")
+        ticket = prepare_ticket(
+            client,
+            [{"document_id": target, "revision": 0, "references": [external]}],
+        )
+        ticket_id = ticket["ticket_id"]
+        barrier = threading.Barrier(2)
+
+        def call_confirm() -> httpx.Response:
+            barrier.wait()
+            return client.http.post(f"/release-tickets/{ticket_id}/confirm", json={})
+
+        def call_retract() -> httpx.Response:
+            barrier.wait()
+            return client.http.post(
+                f"/public/versions/{external_version}/retract", json={}
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            confirm_future = pool.submit(call_confirm)
+            retract_future = pool.submit(call_retract)
+            confirm_response = confirm_future.result()
+            retract_response = retract_future.result()
+
+        assert retract_response.status_code == 200, retract_response.text
+        assert confirm_response.status_code in {201, 409}, confirm_response.text
+
+        if confirm_response.status_code == 201:
+            new_version = confirm_response.json()["items"][0]["public_version_id"]
+            hidden = client.call("GET", f"/public/versions/{new_version}")
+            assert hidden.status_code == 409, hidden.text
+            assert external_version in hidden.json()["error"]["blocked_public_version_ids"]
+            outcome = "confirm-first -> new version hidden"
+        else:
+            assert confirm_response.json()["error"]["code"] == "release_blocked_by_retraction"
+            assert client.call("GET", f"/public/documents/{target}").status_code == 404
+            outcome = "retract-first -> confirm blocked"
+        print(f"round {round_index}: {outcome}")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="doc-review-verify-") as temp_dir:
         db_path = Path(temp_dir) / "review.db"
         process, base_url, _ = start_server(db_path)
         client = Client(base_url)
+        release_state: dict[str, str] = {}
         try:
             doc_id, group_id = verify_prefix_mapping_and_accepted_group_visibility(client)
             verify_group_conflict_is_atomic(client)
             verify_race_and_close(client)
+            (
+                a_id,
+                a_public_id,
+                b_id,
+                _c_id,
+                c_public_id,
+                b_old_public_id,
+            ) = verify_release_prepare_validation(client)
+            verify_retraction(
+                client,
+                a_id=a_id,
+                a_public_id=a_public_id,
+                b_id=b_id,
+                b_old_public_id=b_old_public_id,
+                c_public_id=c_public_id,
+                c_id=_c_id,
+            )
+            verify_confirm_retract_race(client)
+            release_state = {
+                "a_id": a_id,
+                "a_public_id": a_public_id,
+                "b_id": b_id,
+                "b_old_public_id": b_old_public_id,
+                "c_public_id": c_public_id,
+            }
         finally:
             client.close()
             stop_server(process)
 
         verify_restart_persistence(db_path, doc_id, group_id)
+        verify_restart_release_state(db_path, **release_state)
 
     print("\nALL AUTOMATED CHECKS PASSED ✅")
     return 0

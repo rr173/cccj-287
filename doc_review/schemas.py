@@ -53,3 +53,26 @@ class AcceptRequest(BaseModel):
 
 class CloseRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=1000)
+
+
+# ---- Release (publishing) API ----
+
+
+class ReleaseItemInput(BaseModel):
+    document_id: str = Field(min_length=1, max_length=100)
+    revision: int = Field(ge=0)
+    references: list[str] = Field(default_factory=list)
+
+
+class ReleasePrepareRequest(BaseModel):
+    items: list[ReleaseItemInput] = Field(min_length=1)
+    # If supplied, retrying the same prepare call returns the first ticket.
+    request_id: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class ReleaseConfirmRequest(BaseModel):
+    request_id: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class RetractRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=1000)

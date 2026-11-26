@@ -14,14 +14,26 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 
-from .db import connect, init_db
+from .db import connect, init_db, read_transaction
 from .errors import ApiError
 from .schemas import (
     AcceptRequest,
     CloseRequest,
     DocumentCreate,
     EditCreate,
+    ReleaseConfirmRequest,
+    ReleasePrepareRequest,
+    RetractRequest,
     SuggestionGroupCreate,
+)
+from .release import (
+    confirm_release,
+    list_public_versions,
+    prepare_release,
+    read_latest_public,
+    read_public_version,
+    retract_public_version,
+    _ticket_result as release_ticket_body,
 )
 from .service import (
     accept_group,
@@ -247,6 +259,93 @@ def create_app(database_path: str | Path = "data/review.db") -> FastAPI:
             return close_group(
                 conn,
                 group_id,
+                reason=payload.reason if payload is not None else None,
+            )
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Release / public reading.  Everything under /public is read-only and
+    # only exposes versions created by successful release tickets.
+    # ------------------------------------------------------------------
+
+    @app.post("/release-tickets", status_code=201)
+    def post_release_ticket(payload: ReleasePrepareRequest) -> JSONResponse:
+        conn = connect(app.state.database_path)
+        try:
+            result = prepare_release(conn, payload)
+            return JSONResponse(
+                status_code=result.status_code,
+                content=result.body,
+                headers={"Idempotent-Replayed": "true"} if result.replay else None,
+            )
+        finally:
+            conn.close()
+
+    @app.get("/release-tickets/{ticket_id}")
+    def read_release_ticket(ticket_id: str) -> dict[str, Any]:
+        conn = connect(app.state.database_path)
+        try:
+            with read_transaction(conn):
+                return release_ticket_body(conn, ticket_id)
+        finally:
+            conn.close()
+
+    @app.post("/release-tickets/{ticket_id}/confirm")
+    def post_release_confirm(
+        ticket_id: str,
+        payload: ReleaseConfirmRequest | None = None,
+    ) -> JSONResponse:
+        conn = connect(app.state.database_path)
+        try:
+            result = confirm_release(
+                conn, ticket_id, payload or ReleaseConfirmRequest()
+            )
+            return JSONResponse(
+                status_code=result.status_code,
+                content=result.body,
+                headers={"Idempotent-Replayed": "true"} if result.replay else None,
+            )
+        finally:
+            conn.close()
+
+    @app.get("/public/documents/{document_id}")
+    def public_latest(document_id: str) -> dict[str, Any]:
+        conn = connect(app.state.database_path)
+        try:
+            with read_transaction(conn):
+                return read_latest_public(conn, document_id)
+        finally:
+            conn.close()
+
+    @app.get("/public/documents/{document_id}/versions")
+    def public_versions(document_id: str) -> dict[str, Any]:
+        conn = connect(app.state.database_path)
+        try:
+            with read_transaction(conn):
+                return list_public_versions(conn, document_id)
+        finally:
+            conn.close()
+
+    @app.get("/public/versions/{public_version_id}")
+    def public_version(public_version_id: str) -> dict[str, Any]:
+        conn = connect(app.state.database_path)
+        try:
+            with read_transaction(conn):
+                return read_public_version(conn, public_version_id)
+        finally:
+            conn.close()
+
+    @app.post("/public/versions/{public_version_id}/retract")
+    def public_retract(
+        public_version_id: str,
+        payload: RetractRequest | None = None,
+    ) -> dict[str, Any]:
+        conn = connect(app.state.database_path)
+        try:
+            return retract_public_version(
+                conn,
+                public_version_id,
                 reason=payload.reason if payload is not None else None,
             )
         finally:

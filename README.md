@@ -2,6 +2,8 @@
 
 使用 Python + FastAPI + SQLite 实现的无界面文档审阅服务。审阅建议组可以绑定任意历史修订；作者继续编辑后，服务会沿完整修订历史迁移建议区间，并依据历史操作而不是“现在的文字是否相同”判断冲突。
 
+服务同时提供一套**整批发行（release）**流程：编辑准备一张发行单并锁定各文档的正文修订和引用版本，确认后读者才能看到整批内容；发现错误时可以只撤下某个公开版，而不会改动作者稿或回退公开入口。详见下文「发行流程」。
+
 ## 直接运行
 
 ```bash
@@ -70,6 +72,24 @@ curl -i -X POST "$BASE/suggestion-groups/$GRP_ID/accept" \
   -d '{"request_id":"accept-001"}'
 ```
 
+发行一段最小示例（完整流程见下文「发行流程」）：
+
+```bash
+# 准备：锁定 DOC_ID 的修订 3，并按顺序引用 DOC_B、DOC_C
+TICKET=$(curl -sS -X POST "$BASE/release-tickets" \
+  -H 'Content-Type: application/json' \
+  -d '{"items":[{"document_id":"'"$DOC_ID"'","revision":3,"references":["'"$DOC_B"'","'"$DOC_C"'"]}]}' \
+  | jq -r .ticket_id)
+
+# 确认：整单上线，返回每份文档可直接读取的 public_version_id
+curl -sS -X POST "$BASE/release-tickets/$TICKET/confirm" \
+  -H 'Content-Type: application/json' -d '{}' | jq
+
+# 读者按文档读取最新成功发行的版；也可用 public_version_id 读指定旧版
+curl -sS "$BASE/public/documents/$DOC_ID" | jq
+curl -sS "$BASE/public/versions/$PUB_ID" | jq
+```
+
 ## HTTP 接口
 
 | 方法与路径 | 说明 |
@@ -85,6 +105,13 @@ curl -i -X POST "$BASE/suggestion-groups/$GRP_ID/accept" \
 | `POST /suggestion-groups/{group_id}/accept` | 原子接受整组，需在 body 或 `Idempotency-Key` 头中提供 `request_id` |
 | `POST /suggestion-groups/{group_id}/close` | 关闭建议组；关闭后不能接受 |
 | `GET /suggestion-groups/{group_id}/result` | 查阅已成功接受并落为新修订的结果 |
+| `POST /release-tickets` | 准备一张发行单；校验引用并锁定正文修订与外部公开版 |
+| `GET /release-tickets/{ticket_id}` | 查看发行单状态和已锁定的版本 |
+| `POST /release-tickets/{ticket_id}/confirm` | 整单确认发行；重复确认只回放首次结果 |
+| `GET /public/documents/{id}` | 按文档读取最后一次成功发行的公开版 |
+| `GET /public/documents/{id}/versions` | 列出该文档的公开版及是否可读 |
+| `GET /public/versions/{public_version_id}` | 按公开版 ID 读取正文和按序固定的直接引用 |
+| `POST /public/versions/{public_version_id}/retract` | 撤下一个明确的公开版 |
 
 ### 正文编辑冲突
 
@@ -158,6 +185,77 @@ curl -i -X POST "$BASE/suggestion-groups/$GRP_ID/accept" \
 - 已关闭组接受时返回 `suggestion_group_closed`，不会落稿。
 - 所有修订、建议组、逐项建议、幂等结果和关闭原因均在 SQLite 中，重启进程后仍可查询。
 
+## 发行流程
+
+作者修订仍是内部草稿；读者只能通过 `/public` 读取**成功发行**产生的公开版。一张发行单要么整批上线，要么整批不上线。
+
+### 准备发行单
+
+```bash
+curl -sS -X POST "$BASE/release-tickets" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "items": [
+      {"document_id": "'"$DOC_A"'", "revision": 3, "references": ["'"$DOC_B"'", "'"$DOC_C"'"]},
+      {"document_id": "'"$DOC_B"'", "revision": 1, "references": []}
+    ]
+  }' | jq
+```
+
+- 每项提交文档 ID、选定正文修订 `revision`，以及**按展示顺序**列出的直接引用文档 ID `references`。
+- 引用**本单内**的文档时，使用该单为它选定的修订（返回中 `same_ticket=true`）。
+- 引用**本单外**的文档时，锁定准备时该文档的**最新公开版**（返回中给出 `public_version_id` 与 `revision`）。
+- 准备成功返回 `201`，`items[]` 和 `external_locks[]` 让编辑看到每份文档锁定了哪个修订/公开版；正文在准备时已快照。
+- 任何问题都会整单拒绝并返回 `409 release_prepare_rejected`，`error.problems[]` 指出具体位置：
+  - `document_not_found` / `revision_not_found`；
+  - `external_document_has_no_public_version`（外部文档从未成功发行）；
+  - `external_latest_public_version_blocked`（外部文档的最新公开版已不可读，直接或间接被撤下）；
+  - `cyclic_reference`（单内循环引用，`document_ids` 给出具体环路）；
+  - `duplicate_document_in_ticket`。
+- 可选 `request_id` 让准备请求幂等重试。
+- 准备完成后，作者继续改稿、或其他发行单上线，都不会替换本单已锁定的正文和引用。
+
+### 确认发行
+
+```bash
+curl -sS -X POST "$BASE/release-tickets/$TICKET/confirm" \
+  -H 'Content-Type: application/json' -d '{}' | jq
+```
+
+- 成功返回 `201`，`items[].public_version_id` 是每份文档可直接读取的公开版 ID；同一个响应里也给出各版按序固定的引用公开版 ID。
+- 若本单锁定的任何外部公开版（包括它间接引用的版本）已被撤下，返回 `409 release_blocked_by_retraction`，`blocks[]` 指出被阻塞的锁，整单不上线，也不改变此前的公开入口。
+- 重复确认一张已成功发行的单只返回原来的发行结果（HTTP `200`，响应头 `Idempotent-Replayed: true`），不重新上线、不改变最新公开版。
+
+### 读者读取
+
+```bash
+# 按文档读取最后一次成功发行的版
+curl -sS "$BASE/public/documents/$DOC_A" | jq
+
+# 按公开版 ID 读取指定旧版
+curl -sS "$BASE/public/versions/$PUB_ID" | jq
+```
+
+两种读法都返回该版 `content` 和按 `ref_index` 顺序固定的直接引用 `references[].public_version_id`，不会把引用换成最新版。从未成功发行的内容、准备但未确认的发行单，都不能从 `/public` 读取。
+
+### 撤下公开版
+
+```bash
+curl -sS -X POST "$BASE/public/versions/$PUB_ID/retract" \
+  -H 'Content-Type: application/json' -d '{"reason":"勘误"}' | jq
+```
+
+- 撤下的是一个**明确的公开版**，不是整份文档，也不改动作者修订。
+- 撤下后，任何直接或间接引用它的公开版都不能再从 `/public` 取到正文（`409 public_version_blocked`，`blocked_public_version_ids` 列出被撤版本），即使它们不是最新版。
+- 重新发行一份文档不会解除旧版的屏蔽；最新公开版被屏蔽时**不回退**到更旧的版（`GET /public/documents/{id}` 也返回 409）。
+- 与被撤版本无关的公开版，以及所有作者修订（`/documents/...`），仍可读取。
+- 同一公开版重复撤下是幂等的，保留首次撤下记录。
+
+### 并发与持久化
+
+- 确认发行与撤下都在 SQLite `BEGIN IMMEDIATE` 中决策：先撤下则确认被阻塞；先确认则撤下成功后新版本立即可被判定为屏蔽。两种顺序都不会让读者读到受影响的版本。
+- 发行单、公开版、引用关系与撤下记录都持久化在 SQLite，重启后结果不变。
+
 ## 自动化验证
 
 一键端到端验证会自己启动 Uvicorn、使用临时 SQLite 文件、发起真实 HTTP 并发请求，并验证重启持久化：
@@ -174,7 +272,12 @@ python3 verify.py
 4. 三个并发竞争轮次中，不同请求 ID 始终只有一个成功；
 5. 同一请求 ID 的并发重试得到同一份首次结果；
 6. 关闭后不能接受；
-7. 停止并重启服务后，历史修订和已完成结果仍可查阅。
+7. 准备发行单时锁定修订与外部公开版，拒绝缺公开版/循环引用，确认后引用不漂移；
+8. 撤下一个公开版只屏蔽直接/间接引用它的版本，作者稿与无关公开版仍可读；
+9. 并发确认与撤下只有一致结果；
+10. 停止并重启服务后，历史修订、建议结果、公开版、锁定与撤下状态仍可查阅。
+
+上面的 `verify.py` 会打印所有场景的中间结果并断言；`pytest` 另有独立的发行测试（`tests/test_release.py`）覆盖准备校验、幂等、屏蔽传播、并发与重启。
 
 单元/接口测试：
 
@@ -188,6 +291,7 @@ python3 -m pytest -q
 doc_review/
   main.py       # FastAPI 路由与应用工厂
   service.py    # 修订、建议组、幂等和并发接受用例
+  release.py    # 发行单、公开版、引用图与撤下
   mapping.py    # 纯区间迁移/冲突判定逻辑
   db.py         # SQLite schema、连接和立即写事务
   schemas.py    # 请求模型
