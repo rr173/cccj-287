@@ -16,15 +16,28 @@ from fastapi.encoders import jsonable_encoder
 
 from .db import connect, init_db, read_transaction
 from .errors import ApiError
+from .inspection import (
+    complete_work_order,
+    get_inspection,
+    get_work_order,
+    list_inspections,
+    list_pending,
+    list_work_orders,
+    open_work_order,
+    register_inspection,
+)
 from .schemas import (
     AcceptRequest,
     CloseRequest,
     DocumentCreate,
     EditCreate,
+    InspectionCreate,
     ReleaseConfirmRequest,
     ReleasePrepareRequest,
     RetractRequest,
     SuggestionGroupCreate,
+    WorkOrderCompleteRequest,
+    WorkOrderCreate,
 )
 from .release import (
     confirm_release,
@@ -125,6 +138,12 @@ def create_app(database_path: str | Path = "data/review.db") -> FastAPI:
                 "pull": "POST /sync/devices/{device_id}/pull",
                 "page": "GET /sync/devices/{device_id}/batches/{sequence}/pages/{page}",
                 "confirm": "POST /sync/devices/{device_id}/batches/{sequence}/confirm",
+            },
+            "inspection_review": {
+                "register": "POST /inspections",
+                "pending": "GET /inspections/pending",
+                "open_work_order": "POST /review-work-orders",
+                "complete_work_order": "POST /review-work-orders/{work_order_id}/complete",
             },
         }
 
@@ -356,6 +375,130 @@ def create_app(database_path: str | Path = "data/review.db") -> FastAPI:
                 conn,
                 public_version_id,
                 reason=payload.reason if payload is not None else None,
+            )
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # On-site inspection records and re-review work orders.
+    # ------------------------------------------------------------------
+
+    @app.post("/inspections", status_code=201)
+    def post_inspection(payload: InspectionCreate) -> JSONResponse:
+        conn = connect(app.state.database_path)
+        try:
+            result = register_inspection(conn, payload)
+            return JSONResponse(
+                status_code=result.status_code,
+                content=result.body,
+                headers={"Idempotent-Replayed": "true"} if result.replay else None,
+            )
+        finally:
+            conn.close()
+
+    @app.get("/inspections")
+    def get_inspections(
+        asset_id: str | None = Query(default=None),
+        check_item: str | None = Query(default=None),
+        manual_document_id: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        conn = connect(app.state.database_path)
+        try:
+            with read_transaction(conn):
+                return list_inspections(
+                    conn,
+                    asset_id=asset_id,
+                    check_item=check_item,
+                    manual_document_id=manual_document_id,
+                )
+        finally:
+            conn.close()
+
+    @app.get("/inspections/pending")
+    def get_pending_inspections(
+        asset_id: str | None = Query(default=None),
+        check_item: str | None = Query(default=None),
+        manual_document_id: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        conn = connect(app.state.database_path)
+        try:
+            with read_transaction(conn):
+                return list_pending(
+                    conn,
+                    asset_id=asset_id,
+                    check_item=check_item,
+                    manual_document_id=manual_document_id,
+                )
+        finally:
+            conn.close()
+
+    @app.get("/inspections/{record_id}")
+    def read_inspection(record_id: str) -> dict[str, Any]:
+        conn = connect(app.state.database_path)
+        try:
+            with read_transaction(conn):
+                return get_inspection(conn, record_id)
+        finally:
+            conn.close()
+
+    @app.post("/review-work-orders", status_code=201)
+    def post_review_work_order(payload: WorkOrderCreate) -> JSONResponse:
+        conn = connect(app.state.database_path)
+        try:
+            result = open_work_order(conn, payload)
+            return JSONResponse(
+                status_code=result.status_code,
+                content=result.body,
+                headers={"Idempotent-Replayed": "true"} if result.replay else None,
+            )
+        finally:
+            conn.close()
+
+    @app.get("/review-work-orders")
+    def get_review_work_orders(
+        asset_id: str | None = Query(default=None),
+        check_item: str | None = Query(default=None),
+        manual_document_id: str | None = Query(default=None),
+        status: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        conn = connect(app.state.database_path)
+        try:
+            with read_transaction(conn):
+                return list_work_orders(
+                    conn,
+                    asset_id=asset_id,
+                    check_item=check_item,
+                    manual_document_id=manual_document_id,
+                    status=status,
+                )
+        finally:
+            conn.close()
+
+    @app.get("/review-work-orders/{work_order_id}")
+    def read_review_work_order(work_order_id: str) -> dict[str, Any]:
+        conn = connect(app.state.database_path)
+        try:
+            with read_transaction(conn):
+                return get_work_order(conn, work_order_id)
+        finally:
+            conn.close()
+
+    @app.post("/review-work-orders/{work_order_id}/complete")
+    def post_review_work_order_complete(
+        work_order_id: str,
+        payload: WorkOrderCompleteRequest | None = None,
+    ) -> JSONResponse:
+        conn = connect(app.state.database_path)
+        try:
+            result = complete_work_order(
+                conn,
+                work_order_id,
+                payload or WorkOrderCompleteRequest(),
+            )
+            return JSONResponse(
+                status_code=result.status_code,
+                content=result.body,
+                headers={"Idempotent-Replayed": "true"} if result.replay else None,
             )
         finally:
             conn.close()

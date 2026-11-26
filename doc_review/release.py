@@ -27,6 +27,7 @@ from typing import Any, Iterable
 
 from .db import immediate_transaction
 from .errors import ApiError
+from .inspection import apply_retraction
 from .schemas import ReleaseConfirmRequest, ReleasePrepareRequest
 from .service import (
     ResponseEnvelope,
@@ -825,6 +826,15 @@ def retract_public_version(
                     seen.add(candidate)
                     queue.append(candidate)
                     affected.append(candidate)
+
+        # Open or extend re-review rounds inside the same immediate transaction,
+        # so a concurrent work-order open/complete observes either the state
+        # before this retraction or the complete state after it - never a
+        # partially applied retraction.  The inspection module finds affected
+        # records through an index on the current basis, not by scanning the
+        # whole inspection table.
+        newly_unreadable = [public_version_id, *affected]
+        apply_retraction(conn, newly_unreadable, retraction["retracted_at"])
 
         return {
             "public_version_id": public_version_id,

@@ -78,6 +78,29 @@ class RetractRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=1000)
 
 
+# ---- On-site inspection / re-review work orders ----
+
+
+class InspectionCreate(BaseModel):
+    asset_id: str = Field(min_length=1, max_length=200)
+    check_item: str = Field(min_length=1, max_length=200)
+    # The exact public version of the manual that was used for this check.
+    public_version_id: str = Field(min_length=1, max_length=200)
+    request_id: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class WorkOrderCreate(BaseModel):
+    asset_id: str = Field(min_length=1, max_length=200)
+    check_item: str = Field(min_length=1, max_length=200)
+    manual_document_id: str = Field(min_length=1, max_length=200)
+    request_id: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class WorkOrderCompleteRequest(BaseModel):
+    # Exact, still-readable public version of the same manual document.
+    public_version_id: str | None = Field(default=None, min_length=1, max_length=200)
+
+
 # ---- Offline sync API ----
 
 

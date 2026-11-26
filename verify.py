@@ -788,6 +788,143 @@ def verify_confirm_retract_race(client: Client) -> None:
         print(f"round {round_index}: {outcome}")
 
 
+def verify_inspection_review_flow(client: Client) -> dict[str, Any]:
+    section("9. Field inspection -> pending re-review -> one work order closes it")
+
+    manual = client.create_doc("第 1 版：扭矩 90 Nm", "液压手册")
+    edition_1 = client.expect(
+        "POST",
+        "/release-tickets",
+        201,
+        items=[{"document_id": manual, "revision": 0}],
+    )
+    edition_1 = client.expect(
+        "POST", f"/release-tickets/{edition_1['ticket_id']}/confirm", 201
+    )["items"][0]["public_version_id"]
+
+    records = []
+    for _ in range(2):
+        records.append(
+            client.expect(
+                "POST",
+                "/inspections",
+                201,
+                asset_id="press-4",
+                check_item="hydraulic-torque",
+                public_version_id=edition_1,
+            )
+        )
+    print("registered independent records:", len(records))
+
+    client.expect(
+        "POST",
+        f"/public/versions/{edition_1}/retract",
+        200,
+        reason="torque errata",
+    )
+    pending = client.expect("GET", "/inspections/pending", 200)
+    assert pending["count"] == 2
+    assert pending["unreadable_bases"][0]["retracted_public_version_ids"] == [
+        edition_1
+    ]
+    # Historical evidence is not erased by retraction.
+    detail = client.expect("GET", f"/inspections/{records[0]['record_id']}", 200)
+    assert detail["registered_public_version_id"] == edition_1
+    assert detail["status"] == "pending_review"
+    print("both records pending; registered evidence retained")
+
+    # No pending work -> no work order.
+    client.expect(
+        "POST",
+        "/review-work-orders",
+        409,
+        asset_id="press-4",
+        check_item="other-item",
+        manual_document_id=manual,
+    )
+    order = client.expect(
+        "POST",
+        "/review-work-orders",
+        201,
+        asset_id="press-4",
+        check_item="hydraulic-torque",
+        manual_document_id=manual,
+    )
+    assert order["captured_count"] == 2
+    print("work order captured", order["captured_count"], "rounds")
+
+    current = client.current(manual)
+    start = current["content"].index("90")
+    client.expect(
+        "POST",
+        f"/documents/{manual}/edits",
+        201,
+        base_revision=current["current_revision"],
+        start=start,
+        end=start + 2,
+        replacement="120",
+    )
+    ticket = client.expect(
+        "POST",
+        "/release-tickets",
+        201,
+        items=[{"document_id": manual, "revision": current["current_revision"] + 1}],
+    )
+    edition_2 = client.expect(
+        "POST", f"/release-tickets/{ticket['ticket_id']}/confirm", 201
+    )["items"][0]["public_version_id"]
+
+    result = client.expect(
+        "POST",
+        f"/review-work-orders/{order['work_order_id']}/complete",
+        200,
+        public_version_id=edition_2,
+    )
+    assert result["closed_count"] == 2
+    for record in records:
+        after = client.expect("GET", f"/inspections/{record['record_id']}", 200)
+        assert after["status"] == "current"
+        assert after["registered_public_version_id"] == edition_1
+        assert after["current_basis_public_version_id"] == edition_2
+    assert client.expect("GET", "/inspections/pending", 200)["count"] == 0
+
+    # Retry replays the first result and does not touch later pending work.
+    client.expect(
+        "POST",
+        f"/review-work-orders/{order['work_order_id']}/complete",
+        200,
+        public_version_id=edition_2,
+    )
+    print("closed", result["closed_count"], "records into new basis", edition_2)
+
+    return {
+        "manual": manual,
+        "order_id": order["work_order_id"],
+        "record_id": records[0]["record_id"],
+        "edition_1": edition_1,
+        "edition_2": edition_2,
+    }
+
+
+def verify_restart_inspection_state(
+    db_path: Path, manual: str, order_id: str, record_id: str, edition_2: str
+) -> None:
+    section("10. Restart keeps work orders, captured records, and review history")
+    process, base_url, _ = start_server(db_path)
+    client = Client(base_url)
+    try:
+        order = client.expect("GET", f"/review-work-orders/{order_id}", 200)
+        assert order["status"] == "completed"
+        assert order["result"]["closed_count"] == 2
+        record = client.expect("GET", f"/inspections/{record_id}", 200)
+        assert record["current_basis_public_version_id"] == edition_2
+        assert len(record["reviews"]) == 1
+        print("after restart: order completed, record closed against", edition_2)
+    finally:
+        client.close()
+        stop_server(process)
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="doc-review-verify-") as temp_dir:
         db_path = Path(temp_dir) / "review.db"
@@ -816,6 +953,7 @@ def main() -> int:
                 c_id=_c_id,
             )
             verify_confirm_retract_race(client)
+            inspection_state = verify_inspection_review_flow(client)
             release_state = {
                 "a_id": a_id,
                 "a_public_id": a_public_id,
@@ -829,6 +967,13 @@ def main() -> int:
 
         verify_restart_persistence(db_path, doc_id, group_id)
         verify_restart_release_state(db_path, **release_state)
+        verify_restart_inspection_state(
+            db_path,
+            manual=inspection_state["manual"],
+            order_id=inspection_state["order_id"],
+            record_id=inspection_state["record_id"],
+            edition_2=inspection_state["edition_2"],
+        )
 
     print("\nALL AUTOMATED CHECKS PASSED ✅")
     return 0

@@ -151,6 +151,93 @@ CREATE TABLE IF NOT EXISTS public_retractions (
     FOREIGN KEY (public_version_id) REFERENCES public_versions(id) ON DELETE CASCADE
 );
 
+-- A field inspection is a completed check of one asset against one check item,
+-- recorded against the exact public version of a manual that was used on site.
+-- The registered version is preserved forever; current_basis_public_version_id
+-- moves to the version used by the most recent successful re-review.  A record
+-- is "pending" (needs re-review) exactly when it has an open pending round.
+CREATE TABLE IF NOT EXISTS inspection_records (
+    id TEXT PRIMARY KEY,
+    asset_id TEXT NOT NULL,
+    check_item TEXT NOT NULL,
+    manual_document_id TEXT NOT NULL,
+    registered_public_version_id TEXT NOT NULL,
+    current_basis_public_version_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_inspection_records_scope
+    ON inspection_records(asset_id, check_item, manual_document_id, created_at);
+
+-- Retraction looks records up by the current basis id.  This index is what
+-- keeps a retraction from scanning the whole inspection table.
+CREATE INDEX IF NOT EXISTS idx_inspection_records_basis
+    ON inspection_records(current_basis_public_version_id);
+
+-- One open round per record.  The round is the unit a work order captures, so
+-- a record that is closed and later re-opened gets a *new* round id and is not
+-- mistakenly closable by a work order opened during the earlier round.
+CREATE TABLE IF NOT EXISTS inspection_pending_rounds (
+    id TEXT PRIMARY KEY,
+    record_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('open', 'resolved')),
+    basis_public_version_id TEXT NOT NULL,
+    trigger_public_version_ids_json TEXT NOT NULL,
+    opened_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolved_by_work_order_id TEXT,
+    FOREIGN KEY (record_id) REFERENCES inspection_records(id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_inspection_pending_open
+    ON inspection_pending_rounds(record_id) WHERE status = 'open';
+
+CREATE INDEX IF NOT EXISTS idx_inspection_pending_record
+    ON inspection_pending_rounds(record_id, status);
+
+CREATE TABLE IF NOT EXISTS inspection_reviews (
+    id TEXT PRIMARY KEY,
+    record_id TEXT NOT NULL,
+    round_id TEXT,
+    work_order_id TEXT NOT NULL,
+    public_version_id TEXT NOT NULL,
+    reviewed_at TEXT NOT NULL,
+    FOREIGN KEY (record_id) REFERENCES inspection_records(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_inspection_reviews_record
+    ON inspection_reviews(record_id, reviewed_at);
+
+-- A supervisor work order is opened for one (asset, check item, manual
+-- document) and freezes the set of currently pending rounds it covers.
+CREATE TABLE IF NOT EXISTS review_work_orders (
+    id TEXT PRIMARY KEY,
+    asset_id TEXT NOT NULL,
+    check_item TEXT NOT NULL,
+    manual_document_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('open', 'completed')),
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    completion_public_version_id TEXT,
+    result_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_work_orders_scope
+    ON review_work_orders(asset_id, check_item, manual_document_id, created_at);
+
+-- Captured round ids are snapshotted at open time.  Completion may only close
+-- an item while that exact round is still open; a later round for the same
+-- record is a different row and is deliberately not part of the old order.
+CREATE TABLE IF NOT EXISTS review_work_order_items (
+    work_order_id TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    round_id TEXT NOT NULL,
+    basis_public_version_id TEXT NOT NULL,
+    PRIMARY KEY (work_order_id, record_id),
+    FOREIGN KEY (work_order_id) REFERENCES review_work_orders(id) ON DELETE CASCADE
+);
+
 -- Offline sync devices. A device has an independent subscription set and a
 -- monotonic sequence of reconciliation batches. last_ack_sequence is the
 -- newest batch for which the server has accepted the device's confirmation.

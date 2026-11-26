@@ -118,6 +118,14 @@ curl -sS "$BASE/public/versions/$PUB_ID" | jq
 | `GET /sync/devices/{device_id}/batches/{seq}/pages/{page}` | 重复读取同一不可变分页（页码从 1 开始） |
 | `POST /sync/devices/{device_id}/batches/{seq}/confirm`（或 `/ack`） | 所有页取齐并应用后确认；重试确认幂等 |
 | `GET /sync/batches/{batch_id}/pages/{page}` / `POST /sync/batches/{batch_id}/ack` | 只保存了全局批次 ID 时的等价别名 |
+| `POST /inspections` | 登记一次已完成的现场检查：资产、检查项与当时所用的确切公开版 ID |
+| `GET /inspections` | 按 `asset_id` / `check_item` / `manual_document_id` 筛选检查记录 |
+| `GET /inspections/pending` | 列出当前待复核记录及其不可读依据、撤下原因 |
+| `GET /inspections/{record_id}` | 读取单条记录、登记版、当前依据、待复核轮次与历次复核 |
+| `POST /review-work-orders` | 主管按资产、检查项、手册文档开单，圈定当时全部待复核记录 |
+| `GET /review-work-orders` | 按作用域/状态列出工单及其开单时圈定的记录 |
+| `GET /review-work-orders/{work_order_id}` | 读取工单、圈定记录与完工结果 |
+| `POST /review-work-orders/{work_order_id}/complete` | 提交同一手册仍可读的确切公开版，结掉本单仍待办的记录 |
 
 ### 正文编辑冲突
 
@@ -262,6 +270,83 @@ curl -sS -X POST "$BASE/public/versions/$PUB_ID/retract" \
 - 确认发行与撤下都在 SQLite `BEGIN IMMEDIATE` 中决策：先撤下则确认被阻塞；先确认则撤下成功后新版本立即可被判定为屏蔽。两种顺序都不会让读者读到受影响的版本。
 - 发行单、公开版、引用关系与撤下记录都持久化在 SQLite，重启后结果不变。
 
+## 现场检查复核（待办 → 工单 → 结案）
+
+现场按手册某一版完成检查后，把事实登记下来；如果该手册版本后来被发现有错并撤下，检查记录本身仍保留，只把受影响的记录标成“待复核”。主管按资产、检查项和手册文档开一张工单，一次圈定当时全部待办，现场复核后用一次完工结掉它们。
+
+### 登记已完成的检查
+
+```bash
+curl -sS -X POST "$BASE/inspections" \
+  -H 'Content-Type: application/json' \
+  -d '{"asset_id":"press-4","check_item":"hydraulic-torque",
+       "public_version_id":"'"$EDITION_1"'"}' | jq
+```
+
+- 登记必须给出**当时所用确切公开版 ID**，且该版依据必须仍可读；不可读返回 `409 inspection_basis_unreadable`。
+- `manual_document_id` 由该公开版所属文档推导，调用方不必重复提交。
+- 同一 `asset_id` + `check_item` 可以有多笔**互相独立**的记录，各自保留自己的登记版。
+- 每笔记录的 `registered_public_version_id` 永不改写；`current_basis_public_version_id` 初始等于登记版。
+- 可选 `request_id` 让登记幂等重试。
+
+### 撤下手册版本如何影响检查记录
+
+```bash
+curl -sS -X POST "$BASE/public/versions/$EDITION_1/retract" \
+  -H 'Content-Type: application/json' -d '{"reason":"扭矩勘误"}' | jq
+
+curl -sS "$BASE/inspections/pending" | jq
+```
+
+- 撤下与该撤下**在同一个 `BEGIN IMMEDIATE` 事务**中，依据真正变得不可读的记录立即进入待复核；并发开单/完工只看到撤下前或撤下后的完整状态。
+- 依据不可读 = 依据自身被撤下，或它**直接/间接固定引用**的某个公开版被撤下。
+- 进入待复核只是开启一个**待复核轮次**（round），登记版与历史依据照常可查，**不会删除任何检查记录**。
+- 同一依据再增加撤下原因只扩展原轮次的 `retracted_public_version_ids`，不另开一轮。
+- **新发行不会自动结案**；**撤下已被替换的旧依据**也不会让记录重新待办——只有记录当前的依据变不可读才会。
+- 撤下时通过 `current_basis_public_version_id` 上的索引定位受影响记录，不逐条扫描全库检查记录。
+
+### 主管开单
+
+```bash
+WO=$(curl -sS -X POST "$BASE/review-work-orders" \
+  -H 'Content-Type: application/json' \
+  -d '{"asset_id":"press-4","check_item":"hydraulic-torque",
+       "manual_document_id":"'"$MANUAL"'"}' | jq -r .work_order_id)
+```
+
+- 开单时一次性圈定该 `(资产, 检查项, 手册文档)` 当下全部待复核轮次，快照到 `captured_records[]`。
+- 该组**没有待办**时不建单，返回 `409 no_pending_reviews`。
+- 允许不同工单圈到同一条记录/同一轮次；结案时先到先得，后到者跳过已结部分。
+
+### 现场复核后完工
+
+```bash
+curl -sS -X POST "$BASE/review-work-orders/$WO/complete" \
+  -H 'Content-Type: application/json' \
+  -d '{"public_version_id":"'"$EDITION_2"'"}' | jq
+```
+
+- 必须提交**同一手册文档**中一个仍可读的确切公开版 ID。无效依据（别的文档、已撤下/间接屏蔽、缺失）返回 409/422，**既不完工也不结案**。
+- 只能结掉**仍处在开单时那一轮**的待办：
+  - 开单后才新增的待办不归此单；
+  - 已被另一工单结案、之后又因新依据撤下而重开的待办，属于新轮次，旧单不会误结。
+- 每结掉一条，该记录的 `current_basis_public_version_id` 改为本次复核所用版本，并写入一条复核历史；登记版保持不变。
+- 完工结果 `closed_records[]` 列出实际结掉的记录；即使没有任何可结的（都被别的单先结），也可完工，`closed_count` 为 0。
+- 相同 `public_version_id` **原样重试**返回首次结果并带 `Idempotent-Replayed: true`，不再触碰任何待办。
+
+### 查询
+
+```bash
+# 当前待办及不可读依据
+curl -sS "$BASE/inspections/pending" | jq
+# 单条记录：登记版、当前依据、待复核轮次、历次复核
+curl -sS "$BASE/inspections/$RECORD_ID" | jq
+# 工单开单时圈定的记录与实际完工结果
+curl -sS "$BASE/review-work-orders/$WO" | jq '.captured_records, .result'
+```
+
+可运行的完整示例：`python3 examples/inspection_review.py`。自动化测试见 `tests/test_inspection.py`，覆盖登记校验、直接/间接撤下、同依据多原因不另开轮、新发行不结案、旧依据撤下不重开、开单圈定、部分/全部结案、旧单不结新轮次、幂等重试、并发一致性与重启持久化。
+
 ## HTTP 离线同步
 
 现场设备在有网时同步，随后离线使用。设备**不需要、也不会上传本地清单**；服务端依据当前公开图、设备订阅、已确认序号以及所有尚未确认但可能已被应用的批次做保守对账。
@@ -381,7 +466,7 @@ python3 verify.py
 python3 -m pytest -q
 ```
 
-其中 `tests/test_sync.py` 专门验证离线同步协议；该文件使用 FastAPI `TestClient` 和临时 SQLite，不需要额外客户端界面。
+其中 `tests/test_sync.py` 专门验证离线同步协议；`tests/test_inspection.py` 验证现场检查复核流程。两者都使用 FastAPI `TestClient` 和临时 SQLite，不需要额外客户端界面。
 
 ## 主要文件
 
@@ -390,6 +475,7 @@ doc_review/
   main.py       # FastAPI 路由与应用工厂
   service.py    # 修订、建议组、幂等和并发接受用例
   release.py    # 发行单、公开版、引用图与撤下
+  inspection.py # 现场检查记录、复核待办轮次、主管工单与结案
   sync.py       # 离线设备目标图、批次/分页、失效与漏确认对账
   sync_api.py   # 离线同步 HTTP 路由
   mapping.py    # 纯区间迁移/冲突判定逻辑
@@ -398,4 +484,5 @@ doc_review/
 verify.py       # 真实 HTTP + 并发 + 重启的端到端验证
 examples/
   quickstart.py # 简短调用示例
+  inspection_review.py # 主管从待办到结案的 HTTP 示例
 ```
